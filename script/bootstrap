@@ -1,63 +1,30 @@
 #!/usr/bin/env node
 
-var fs = require('fs');
+'use strict'
 
-var nodeVersion = process.versions.node.split('.')
-var nodeMajorVersion = +nodeVersion[0]
-var nodeMinorVersion = +nodeVersion[1]
-if (nodeMajorVersion === 0 && nodeMinorVersion < 10) {
-  console.warn("You must run script/bootstrap and script/build with node v0.10 or above");
-  process.exit(1);
+const cleanDependencies = require('./lib/clean-dependencies')
+const deleteMsbuildFromPath = require('./lib/delete-msbuild-from-path')
+const dependenciesFingerprint = require('./lib/dependencies-fingerprint')
+const installApm = require('./lib/install-apm')
+const installAtomDependencies = require('./lib/install-atom-dependencies')
+const installScriptDependencies = require('./lib/install-script-dependencies')
+const verifyMachineRequirements = require('./lib/verify-machine-requirements')
+
+process.on('unhandledRejection', function (e) {
+  console.error(e.stack || e)
+  process.exit(1)
+})
+
+verifyMachineRequirements()
+
+if (dependenciesFingerprint.isOutdated()) {
+  cleanDependencies()
 }
 
-// Make sure python2.7 is installed
-if (process.platform == 'win32' && !fs.existsSync('C:\\Python27\\')) {
-  console.warn("You must have Python 2.7 installed at 'C:\\Python27\\'");
-  process.exit(1);
-}
+if (process.platform === 'win32') deleteMsbuildFromPath()
 
-var safeExec = require('./utils/child-process-wrapper.js').safeExec;
-var fs = require('fs');
-var path = require('path');
+installScriptDependencies()
+installApm()
+installAtomDependencies()
 
-// Executes an array of commands one by one.
-function executeCommands(commands, done, index) {
-  index = (index == undefined ? 0 : index);
-  if (index < commands.length) {
-    var command = commands[index];
-    var options = null;
-    if (typeof command !== 'string') {
-      options = command.options;
-      command = command.command;
-    }
-    safeExec(command, options, executeCommands.bind(this, commands, done, index + 1));
-  } else
-    done(null);
-}
-
-var apmInstallPath = path.resolve(__dirname, '..', 'apm');
-if (!fs.existsSync(apmInstallPath))
-  fs.mkdirSync(apmInstallPath);
-if (!fs.existsSync(path.join(apmInstallPath, 'node_modules')))
-  fs.mkdirSync(path.join(apmInstallPath, 'node_modules'));
-
-var apmPath = path.resolve(__dirname, '..', 'apm', 'node_modules', 'atom-package-manager', 'bin', 'apm')
-var apmFlags = process.env.JANKY_SHA1 || process.argv.indexOf('--no-color') !== -1 ? '--no-color' : '';
-
-var npmPath = path.resolve(__dirname, '..', 'build', 'node_modules', '.bin', 'npm');
-var npmFlags = ' --userconfig=' + path.resolve('.npmrc') + ' ';
-
-var packagesToDedupe = ['fs-plus', 'humanize-plus', 'oniguruma', 'roaster', 'season'];
-var echoNewLine = process.platform == 'win32' ? 'echo.' : 'echo';
-
-var commands = [
-  {command: 'npm' + npmFlags + 'install --quiet', options: {cwd: path.resolve(__dirname, '..', 'build'), ignoreStdout: true}},
-  {command: npmPath + npmFlags + 'install --quiet', options: {cwd: apmInstallPath, ignoreStdout: true}},
-  echoNewLine,
-  apmPath + ' clean ' + apmFlags,
-  apmPath + ' install --quiet ' + apmFlags,
-  apmPath + ' dedupe --quiet ' + apmFlags + ' ' + packagesToDedupe.join(' '),
-];
-
-process.chdir(path.dirname(__dirname));
-executeCommands(commands, process.exit);
+dependenciesFingerprint.write()

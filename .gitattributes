@@ -6,3 +6,12 @@ spec/fixtures/**/*.less text eol=lf
 spec/fixtures/**/*.css text eol=lf
 spec/fixtures/**/*.txt text eol=lf
 spec/fixtures/dir/**/* text eol=lf
+
+# Git 1.7 does not support **/* patterns
+spec/fixtures/css.css text eol=lf
+spec/fixtures/sample.js text eol=lf
+spec/fixtures/sample.less text eol=lf
+spec/fixtures/sample.txt text eol=lf
+
+# Windows bash scripts are also Unix LF endings
+*.sh		eol=lf

@@ -1,98 +1,118 @@
 _ = require 'underscore-plus'
-{Model} = require 'theorist'
+{CompositeDisposable, Emitter} = require 'event-kit'
 {Point, Range} = require 'text-buffer'
-Serializable = require 'serializable'
+Model = require './model'
 TokenizedLine = require './tokenized-line'
-Token = require './token'
+TokenIterator = require './token-iterator'
+ScopeDescriptor = require './scope-descriptor'
+TokenizedBufferIterator = require './tokenized-buffer-iterator'
+NullGrammar = require './null-grammar'
 
 module.exports =
 class TokenizedBuffer extends Model
-  Serializable.includeInto(this)
-
-  @property 'tabLength'
-
   grammar: null
-  currentGrammarScore: null
   buffer: null
+  tabLength: null
   tokenizedLines: null
   chunkSize: 50
   invalidRows: null
   visible: false
+  changeCount: 0
 
-  constructor: ({@buffer, @tabLength}) ->
-    @tabLength ?= atom.config.getPositiveInt('editor.tabLength', 2)
-
-    @subscribe atom.syntax, 'grammar-added grammar-updated', (grammar) =>
-      if grammar.injectionSelector?
-        @resetTokenizedLines() if @hasTokenForSelector(grammar.injectionSelector)
-      else
-        newScore = grammar.getScore(@buffer.getPath(), @buffer.getText())
-        @setGrammar(grammar, newScore) if newScore > @currentGrammarScore
-
-    @on 'grammar-changed grammar-updated', => @resetTokenizedLines()
-    @subscribe @buffer, "changed", (e) => @handleBufferChange(e)
-    @subscribe @buffer, "path-changed", => @bufferPath = @buffer.getPath()
-
-    @subscribe @$tabLength.changes, (tabLength) =>
-      lastRow = @buffer.getLastRow()
-      @tokenizedLines = @buildPlaceholderTokenizedLinesForRows(0, lastRow)
-      @invalidateRow(0)
-      @emit "changed", { start: 0, end: lastRow, delta: 0 }
-
-    @subscribe atom.config.observe 'editor.tabLength', callNow: false, =>
-      @setTabLength(atom.config.getPositiveInt('editor.tabLength', 2))
-
-    @reloadGrammar()
-
-  serializeParams: ->
-    bufferPath: @buffer.getPath()
-    tabLength: @tabLength
-
-  deserializeParams: (params) ->
-    params.buffer = atom.project.bufferForPathSync(params.bufferPath)
-    params
-
-  setGrammar: (grammar, score) ->
-    return if grammar is @grammar
-    @unsubscribe(@grammar) if @grammar
-    @grammar = grammar
-    @currentGrammarScore = score ? grammar.getScore(@buffer.getPath(), @buffer.getText())
-    @subscribe @grammar, 'grammar-updated', => @resetTokenizedLines()
-    @emit 'grammar-changed', grammar
-
-  reloadGrammar: ->
-    if grammar = atom.syntax.selectGrammar(@buffer.getPath(), @buffer.getText())
-      @setGrammar(grammar)
+  @deserialize: (state, atomEnvironment) ->
+    if state.bufferId
+      state.buffer = atomEnvironment.project.bufferForIdSync(state.bufferId)
     else
-      throw new Error("No grammar found for path: #{path}")
+      # TODO: remove this fallback after everyone transitions to the latest version.
+      state.buffer = atomEnvironment.project.bufferForPathSync(state.bufferPath)
+    state.assert = atomEnvironment.assert
+    new this(state)
+
+  constructor: (params) ->
+    {grammar, @buffer, @tabLength, @largeFileMode, @assert} = params
+
+    @emitter = new Emitter
+    @disposables = new CompositeDisposable
+    @tokenIterator = new TokenIterator(this)
+
+    @disposables.add @buffer.registerTextDecorationLayer(this)
+
+    @setGrammar(grammar ? NullGrammar)
+
+  destroyed: ->
+    @disposables.dispose()
+
+  buildIterator: ->
+    new TokenizedBufferIterator(this)
+
+  getInvalidatedRanges: ->
+    []
+
+  onDidInvalidateRange: (fn) ->
+    @emitter.on 'did-invalidate-range', fn
+
+  serialize: ->
+    {
+      deserializer: 'TokenizedBuffer'
+      bufferPath: @buffer.getPath()
+      bufferId: @buffer.getId()
+      tabLength: @tabLength
+      largeFileMode: @largeFileMode
+    }
+
+  observeGrammar: (callback) ->
+    callback(@grammar)
+    @onDidChangeGrammar(callback)
+
+  onDidChangeGrammar: (callback) ->
+    @emitter.on 'did-change-grammar', callback
+
+  onDidTokenize: (callback) ->
+    @emitter.on 'did-tokenize', callback
+
+  setGrammar: (grammar) ->
+    return unless grammar? and grammar isnt @grammar
+
+    @grammar = grammar
+    @rootScopeDescriptor = new ScopeDescriptor(scopes: [@grammar.scopeName])
+
+    @grammarUpdateDisposable?.dispose()
+    @grammarUpdateDisposable = @grammar.onDidUpdate => @retokenizeLines()
+    @disposables.add(@grammarUpdateDisposable)
+
+    @retokenizeLines()
+
+    @emitter.emit 'did-change-grammar', grammar
+
+  getGrammarSelectionContent: ->
+    @buffer.getTextInRange([[0, 0], [10, 0]])
 
   hasTokenForSelector: (selector) ->
-    for {tokens} in @tokenizedLines
-      for token in tokens
+    for tokenizedLine in @tokenizedLines when tokenizedLine?
+      for token in tokenizedLine.tokens
         return true if selector.matches(token.scopes)
     false
 
-  resetTokenizedLines: ->
-    @tokenizedLines = @buildPlaceholderTokenizedLinesForRows(0, @buffer.getLastRow())
+  retokenizeLines: ->
+    @fullyTokenized = false
+    @tokenizedLines = new Array(@buffer.getLineCount())
     @invalidRows = []
-    @invalidateRow(0)
+    if @largeFileMode or @grammar.name is 'Null Grammar'
+      @markTokenizationComplete()
+    else
+      @invalidateRow(0)
 
   setVisible: (@visible) ->
-    @tokenizeInBackground() if @visible
+    if @visible and @grammar.name isnt 'Null Grammar' and not @largeFileMode
+      @tokenizeInBackground()
 
-  # Retrieves the current tab length.
-  #
-  # Returns a {Number}.
-  getTabLength: ->
-    @tabLength
+  getTabLength: -> @tabLength
 
-  # Specifies the tab length.
-  #
-  # tabLength - A {Number} that defines the new tab length.
   setTabLength: (@tabLength) ->
 
   tokenizeInBackground: ->
     return if not @visible or @pendingChunk or not @isAlive()
+
     @pendingChunk = true
     _.defer =>
       @pendingChunk = false
@@ -102,33 +122,45 @@ class TokenizedBuffer extends Model
     rowsRemaining = @chunkSize
 
     while @firstInvalidRow()? and rowsRemaining > 0
-      invalidRow = @invalidRows.shift()
+      startRow = @invalidRows.shift()
       lastRow = @getLastRow()
-      continue if invalidRow > lastRow
+      continue if startRow > lastRow
 
-      row = invalidRow
+      row = startRow
       loop
         previousStack = @stackForRow(row)
-        @tokenizedLines[row] = @buildTokenizedTokenizedLineForRow(row, @stackForRow(row - 1))
-        if --rowsRemaining == 0
+        @tokenizedLines[row] = @buildTokenizedLineForRow(row, @stackForRow(row - 1), @openScopesForRow(row))
+        if --rowsRemaining is 0
           filledRegion = false
+          endRow = row
           break
-        if row == lastRow or _.isEqual(@stackForRow(row), previousStack)
+        if row is lastRow or _.isEqual(@stackForRow(row), previousStack)
           filledRegion = true
+          endRow = row
           break
         row++
 
-      @validateRow(row)
-      @invalidateRow(row + 1) unless filledRegion
-      @emit "changed", { start: invalidRow, end: row, delta: 0 }
+      @validateRow(endRow)
+      @invalidateRow(endRow + 1) unless filledRegion
 
-    @tokenizeInBackground() if @firstInvalidRow()?
+      @emitter.emit 'did-invalidate-range', Range(Point(startRow, 0), Point(endRow + 1, 0))
+
+    if @firstInvalidRow()?
+      @tokenizeInBackground()
+    else
+      @markTokenizationComplete()
+
+  markTokenizationComplete: ->
+    unless @fullyTokenized
+      @emitter.emit 'did-tokenize'
+    @fullyTokenized = true
 
   firstInvalidRow: ->
     @invalidRows[0]
 
   validateRow: (row) ->
     @invalidRows.shift() while @invalidRows[0] <= row
+    return
 
   invalidateRow: (row) ->
     @invalidRows.push(row)
@@ -144,33 +176,70 @@ class TokenizedBuffer extends Model
       else if row > end
         row + delta
 
-  handleBufferChange: (e) ->
+  bufferDidChange: (e) ->
+    @changeCount = @buffer.changeCount
+
     {oldRange, newRange} = e
     start = oldRange.start.row
     end = oldRange.end.row
     delta = newRange.end.row - oldRange.end.row
+    oldLineCount = oldRange.end.row - oldRange.start.row + 1
+    newLineCount = newRange.end.row - newRange.start.row + 1
 
     @updateInvalidRows(start, end, delta)
     previousEndStack = @stackForRow(end) # used in spill detection below
-    newTokenizedLines = @buildTokenizedLinesForRows(start, end + delta, @stackForRow(start - 1))
-    _.spliceWithArray(@tokenizedLines, start, end - start + 1, newTokenizedLines)
-    newEndStack = @stackForRow(end + delta)
+    if @largeFileMode or @grammar.name is 'Null Grammar'
+      _.spliceWithArray(@tokenizedLines, start, oldLineCount, new Array(newLineCount))
+    else
+      newTokenizedLines = @buildTokenizedLinesForRows(start, end + delta, @stackForRow(start - 1), @openScopesForRow(start))
+      _.spliceWithArray(@tokenizedLines, start, oldLineCount, newTokenizedLines)
+      newEndStack = @stackForRow(end + delta)
+      if newEndStack and not _.isEqual(newEndStack, previousEndStack)
+        @invalidateRow(end + delta + 1)
 
-    if newEndStack and not _.isEqual(newEndStack, previousEndStack)
-      @invalidateRow(end + delta + 1)
+  isFoldableAtRow: (row) ->
+    if @largeFileMode
+      false
+    else
+      @isFoldableCodeAtRow(row) or @isFoldableCommentAtRow(row)
 
-    @emit "changed", { start, end, delta, bufferChange: e }
-
-  buildTokenizedLinesForRows: (startRow, endRow, startingStack) ->
-    ruleStack = startingStack
-    stopTokenizingAt = startRow + @chunkSize
-    tokenizedLines = for row in [startRow..endRow]
-      if (ruleStack or row == 0) and row < stopTokenizingAt
-        screenLine = @buildTokenizedTokenizedLineForRow(row, ruleStack)
-        ruleStack = screenLine.ruleStack
+  # Returns a {Boolean} indicating whether the given buffer row starts
+  # a a foldable row range due to the code's indentation patterns.
+  isFoldableCodeAtRow: (row) ->
+    if 0 <= row <= @buffer.getLastRow()
+      nextRow = @buffer.nextNonBlankRow(row)
+      tokenizedLine = @tokenizedLines[row]
+      if @buffer.isRowBlank(row) or tokenizedLine?.isComment() or not nextRow?
+        false
       else
-        screenLine = @buildPlaceholderTokenizedLineForRow(row)
-      screenLine
+        @indentLevelForRow(nextRow) > @indentLevelForRow(row)
+    else
+      false
+
+  isFoldableCommentAtRow: (row) ->
+    previousRow = row - 1
+    nextRow = row + 1
+    if nextRow > @buffer.getLastRow()
+      false
+    else
+      Boolean(
+        not (@tokenizedLines[previousRow]?.isComment()) and
+        @tokenizedLines[row]?.isComment() and
+        @tokenizedLines[nextRow]?.isComment()
+      )
+
+  buildTokenizedLinesForRows: (startRow, endRow, startingStack, startingopenScopes) ->
+    ruleStack = startingStack
+    openScopes = startingopenScopes
+    stopTokenizingAt = startRow + @chunkSize
+    tokenizedLines = for row in [startRow..endRow] by 1
+      if (ruleStack or row is 0) and row < stopTokenizingAt
+        tokenizedLine = @buildTokenizedLineForRow(row, ruleStack, openScopes)
+        ruleStack = tokenizedLine.ruleStack
+        openScopes = @scopesFromTags(openScopes, tokenizedLine.tags)
+      else
+        tokenizedLine = undefined
+      tokenizedLine
 
     if endRow >= stopTokenizingAt
       @invalidateRow(stopTokenizingAt)
@@ -178,159 +247,173 @@ class TokenizedBuffer extends Model
 
     tokenizedLines
 
-  buildPlaceholderTokenizedLinesForRows: (startRow, endRow) ->
-    @buildPlaceholderTokenizedLineForRow(row) for row in [startRow..endRow]
+  buildTokenizedLineForRow: (row, ruleStack, openScopes) ->
+    @buildTokenizedLineForRowWithText(row, @buffer.lineForRow(row), ruleStack, openScopes)
 
-  buildPlaceholderTokenizedLineForRow: (row) ->
-    line = @buffer.lineForRow(row)
-    tokens = [new Token(value: line, scopes: [@grammar.scopeName])]
-    tabLength = @getTabLength()
-    indentLevel = @indentLevelForRow(row)
-    new TokenizedLine({tokens, tabLength, indentLevel})
-
-  buildTokenizedTokenizedLineForRow: (row, ruleStack) ->
-    line = @buffer.lineForRow(row)
+  buildTokenizedLineForRowWithText: (row, text, ruleStack = @stackForRow(row - 1), openScopes = @openScopesForRow(row)) ->
     lineEnding = @buffer.lineEndingForRow(row)
-    tabLength = @getTabLength()
-    indentLevel = @indentLevelForRow(row)
-    { tokens, ruleStack } = @grammar.tokenizeLine(line, ruleStack, row is 0)
-    new TokenizedLine({tokens, ruleStack, tabLength, lineEnding, indentLevel})
+    {tags, ruleStack} = @grammar.tokenizeLine(text, ruleStack, row is 0, false)
+    new TokenizedLine({openScopes, text, tags, ruleStack, lineEnding, @tokenIterator})
 
-  # FIXME: benogle says: These are actually buffer rows as all buffer rows are
-  # accounted for in @tokenizedLines
-  lineForScreenRow: (row) ->
-    @linesForScreenRows(row, row)[0]
+  tokenizedLineForRow: (bufferRow) ->
+    if 0 <= bufferRow <= @buffer.getLastRow()
+      if tokenizedLine = @tokenizedLines[bufferRow]
+        tokenizedLine
+      else
+        text = @buffer.lineForRow(bufferRow)
+        lineEnding = @buffer.lineEndingForRow(bufferRow)
+        tags = [@grammar.startIdForScope(@grammar.scopeName), text.length, @grammar.endIdForScope(@grammar.scopeName)]
+        @tokenizedLines[bufferRow] = new TokenizedLine({openScopes: [], text, tags, lineEnding, @tokenIterator})
 
-  # FIXME: benogle says: These are actually buffer rows as all buffer rows are
-  # accounted for in @tokenizedLines
-  linesForScreenRows: (startRow, endRow) ->
-    @tokenizedLines[startRow..endRow]
+  tokenizedLinesForRows: (startRow, endRow) ->
+    for row in [startRow..endRow] by 1
+      @tokenizedLineForRow(row)
 
-  stackForRow: (row) ->
-    @tokenizedLines[row]?.ruleStack
+  stackForRow: (bufferRow) ->
+    @tokenizedLines[bufferRow]?.ruleStack
 
-  indentLevelForRow: (row) ->
-    line = @buffer.lineForRow(row)
+  openScopesForRow: (bufferRow) ->
+    if precedingLine = @tokenizedLines[bufferRow - 1]
+      @scopesFromTags(precedingLine.openScopes, precedingLine.tags)
+    else
+      []
+
+  scopesFromTags: (startingScopes, tags) ->
+    scopes = startingScopes.slice()
+    for tag in tags when tag < 0
+      if (tag % 2) is -1
+        scopes.push(tag)
+      else
+        matchingStartTag = tag + 1
+        loop
+          break if scopes.pop() is matchingStartTag
+          if scopes.length is 0
+            @assert false, "Encountered an unmatched scope end tag.", (error) =>
+              error.metadata = {
+                grammarScopeName: @grammar.scopeName
+                unmatchedEndTag: @grammar.scopeForId(tag)
+              }
+              path = require 'path'
+              error.privateMetadataDescription = "The contents of `#{path.basename(@buffer.getPath())}`"
+              error.privateMetadata = {
+                filePath: @buffer.getPath()
+                fileContents: @buffer.getText()
+              }
+            break
+    scopes
+
+  indentLevelForRow: (bufferRow) ->
+    line = @buffer.lineForRow(bufferRow)
+    indentLevel = 0
 
     if line is ''
-      nextRow = row + 1
+      nextRow = bufferRow + 1
       lineCount = @getLineCount()
       while nextRow < lineCount
         nextLine = @buffer.lineForRow(nextRow)
-        return @indentLevelForLine(nextLine) unless nextLine is ''
+        unless nextLine is ''
+          indentLevel = Math.ceil(@indentLevelForLine(nextLine))
+          break
         nextRow++
 
-      previousRow = row - 1
+      previousRow = bufferRow - 1
       while previousRow >= 0
         previousLine = @buffer.lineForRow(previousRow)
-        return @indentLevelForLine(previousLine) unless previousLine is ''
+        unless previousLine is ''
+          indentLevel = Math.max(Math.ceil(@indentLevelForLine(previousLine)), indentLevel)
+          break
         previousRow--
 
-      0
+      indentLevel
     else
       @indentLevelForLine(line)
 
   indentLevelForLine: (line) ->
     if match = line.match(/^[\t ]+/)
-      leadingWhitespace = match[0]
-      tabCount = leadingWhitespace.match(/\t/g)?.length ? 0
-      spaceCount = leadingWhitespace.match(/[ ]/g)?.length ? 0
-      tabCount + (spaceCount / @getTabLength())
+      indentLength = 0
+      for character in match[0]
+        if character is '\t'
+          indentLength += @getTabLength() - (indentLength % @getTabLength())
+        else
+          indentLength++
+
+      indentLength / @getTabLength()
     else
       0
 
-  scopesForPosition: (position) ->
-    @tokenForPosition(position).scopes
+  scopeDescriptorForPosition: (position) ->
+    {row, column} = @buffer.clipPosition(Point.fromObject(position))
+
+    iterator = @tokenizedLineForRow(row).getTokenIterator()
+    while iterator.next()
+      if iterator.getBufferEnd() > column
+        scopes = iterator.getScopes()
+        break
+
+    # rebuild scope of last token if we iterated off the end
+    unless scopes?
+      scopes = iterator.getScopes()
+      scopes.push(iterator.getScopeEnds().reverse()...)
+
+    new ScopeDescriptor({scopes})
 
   tokenForPosition: (position) ->
     {row, column} = Point.fromObject(position)
-    @tokenizedLines[row].tokenAtBufferColumn(column)
+    @tokenizedLineForRow(row).tokenAtBufferColumn(column)
 
   tokenStartPositionForPosition: (position) ->
     {row, column} = Point.fromObject(position)
-    column = @tokenizedLines[row].tokenStartColumnForBufferColumn(column)
+    column = @tokenizedLineForRow(row).tokenStartColumnForBufferColumn(column)
     new Point(row, column)
 
   bufferRangeForScopeAtPosition: (selector, position) ->
     position = Point.fromObject(position)
-    tokenizedLine = @tokenizedLines[position.row]
-    startIndex = tokenizedLine.tokenIndexAtBufferColumn(position.column)
 
-    for index in [startIndex..0]
-      token = tokenizedLine.tokenAtIndex(index)
-      break unless token.matchesScopeSelector(selector)
-      firstToken = token
+    {openScopes, tags} = @tokenizedLineForRow(position.row)
+    scopes = openScopes.map (tag) => @grammar.scopeForId(tag)
 
-    for index in [startIndex...tokenizedLine.getTokenCount()]
-      token = tokenizedLine.tokenAtIndex(index)
-      break unless token.matchesScopeSelector(selector)
-      lastToken = token
+    startColumn = 0
+    for tag, tokenIndex in tags
+      if tag < 0
+        if tag % 2 is -1
+          scopes.push(@grammar.scopeForId(tag))
+        else
+          scopes.pop()
+      else
+        endColumn = startColumn + tag
+        if endColumn >= position.column
+          break
+        else
+          startColumn = endColumn
 
-    return unless firstToken? and lastToken?
 
-    startColumn = tokenizedLine.bufferColumnForToken(firstToken)
-    endColumn = tokenizedLine.bufferColumnForToken(lastToken) + lastToken.bufferDelta
-    new Range([position.row, startColumn], [position.row, endColumn])
+    return unless selectorMatchesAnyScope(selector, scopes)
 
-  iterateTokensInBufferRange: (bufferRange, iterator) ->
-    bufferRange = Range.fromObject(bufferRange)
-    { start, end } = bufferRange
+    startScopes = scopes.slice()
+    for startTokenIndex in [(tokenIndex - 1)..0] by -1
+      tag = tags[startTokenIndex]
+      if tag < 0
+        if tag % 2 is -1
+          startScopes.pop()
+        else
+          startScopes.push(@grammar.scopeForId(tag))
+      else
+        break unless selectorMatchesAnyScope(selector, startScopes)
+        startColumn -= tag
 
-    keepLooping = true
-    stop = -> keepLooping = false
+    endScopes = scopes.slice()
+    for endTokenIndex in [(tokenIndex + 1)...tags.length] by 1
+      tag = tags[endTokenIndex]
+      if tag < 0
+        if tag % 2 is -1
+          endScopes.push(@grammar.scopeForId(tag))
+        else
+          endScopes.pop()
+      else
+        break unless selectorMatchesAnyScope(selector, endScopes)
+        endColumn += tag
 
-    for bufferRow in [start.row..end.row]
-      bufferColumn = 0
-      for token in @tokenizedLines[bufferRow].tokens
-        startOfToken = new Point(bufferRow, bufferColumn)
-        iterator(token, startOfToken, { stop }) if bufferRange.containsPoint(startOfToken)
-        return unless keepLooping
-        bufferColumn += token.bufferDelta
-
-  backwardsIterateTokensInBufferRange: (bufferRange, iterator) ->
-    bufferRange = Range.fromObject(bufferRange)
-    { start, end } = bufferRange
-
-    keepLooping = true
-    stop = -> keepLooping = false
-
-    for bufferRow in [end.row..start.row]
-      bufferColumn = @buffer.lineLengthForRow(bufferRow)
-      for token in new Array(@tokenizedLines[bufferRow].tokens...).reverse()
-        bufferColumn -= token.bufferDelta
-        startOfToken = new Point(bufferRow, bufferColumn)
-        iterator(token, startOfToken, { stop }) if bufferRange.containsPoint(startOfToken)
-        return unless keepLooping
-
-  findOpeningBracket: (startBufferPosition) ->
-    range = [[0,0], startBufferPosition]
-    position = null
-    depth = 0
-    @backwardsIterateTokensInBufferRange range, (token, startPosition, { stop }) ->
-      if token.isBracket()
-        if token.value == '}'
-          depth++
-        else if token.value == '{'
-          depth--
-          if depth == 0
-            position = startPosition
-            stop()
-    position
-
-  findClosingBracket: (startBufferPosition) ->
-    range = [startBufferPosition, @buffer.getEndPosition()]
-    position = null
-    depth = 0
-    @iterateTokensInBufferRange range, (token, startPosition, { stop }) ->
-      if token.isBracket()
-        if token.value == '{'
-          depth++
-        else if token.value == '}'
-          depth--
-          if depth == 0
-            position = startPosition
-            stop()
-    position
+    new Range(new Point(position.row, startColumn), new Point(position.row, endColumn))
 
   # Gets the row number of the last line.
   #
@@ -343,5 +426,12 @@ class TokenizedBuffer extends Model
 
   logLines: (start=0, end=@buffer.getLastRow()) ->
     for row in [start..end]
-      line = @lineForScreenRow(row).text
+      line = @tokenizedLines[row].text
       console.log row, line, line.length
+    return
+
+selectorMatchesAnyScope = (selector, scopes) ->
+  targetClasses = selector.replace(/^\./, '').split('.')
+  _.any scopes, (scope) ->
+    scopeClasses = scope.split('.')
+    _.isSubset(targetClasses, scopeClasses)
